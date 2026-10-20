@@ -409,7 +409,7 @@ cmd_list() {
 cmd_diff() {
   (( $# <= 2 )) || die "использование: slepok diff [СНИМОК_А] [СНИМОК_Б]"
   require rsync
-  local from to flags path line added=0 changed=0 removed=0
+  local from to flags path line n_added=0 n_changed=0 n_removed=0
   from="$(resolve_snapshot "${1:-previous}")"
   to="$(resolve_snapshot "${2:-latest}")"
   [[ "$from" != "$to" ]] || die "это один и тот же снимок"
@@ -422,22 +422,22 @@ cmd_diff() {
       '*deleting')
         if [[ "$path" != */ ]]; then
           printf -- '- %s\n' "$path"
-          removed=$((removed + 1))
+          n_removed=$((n_removed + 1))
         fi
         ;;
       '>f+++++++++' | 'cL+++++++++')
         printf '+ %s\n' "$path"
-        added=$((added + 1))
+        n_added=$((n_added + 1))
         ;;
       '>f'* | 'cL'*)
         printf '~ %s\n' "$path"
-        changed=$((changed + 1))
+        n_changed=$((n_changed + 1))
         ;;
     esac
   done < <(rsync --archive --dry-run --delete --no-human-readable \
              --out-format=$'%i\t%n' "$DEST/$to/" "$DEST/$from/")
 
-  log "Добавлено: $added, изменено: $changed, удалено: $removed"
+  log "Добавлено: $n_added, изменено: $n_changed, удалено: $n_removed"
 }
 
 cmd_history() {
