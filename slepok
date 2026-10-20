@@ -419,7 +419,7 @@ cmd_diff() {
     flags="${line%%$'\t'*}"
     path="/${line#*$'\t'}"
     case "$flags" in
-      '*deleting')
+      '*deleting'*)
         if [[ "$path" != */ ]]; then
           printf -- '- %s\n' "$path"
           n_removed=$((n_removed + 1))
