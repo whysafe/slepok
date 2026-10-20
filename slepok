@@ -394,12 +394,12 @@ cmd_list() {
   mapfile -t added < <(du -sk -- "${paths[@]}" | cut -f1)
   full_kb="$(du -sklc -- "${paths[@]}" | tail -n 1 | cut -f1)"
 
-  printf '%-19s  %10s\n' "SNAPSHOT" "ADDED"
+  printf '%-17s  %10s\n' "SNAPSHOT" "ADDED"
   for i in "${!snaps[@]}"; do
     note=""
     if (( i == 0 )); then note="  полная копия"; fi
     if (( i == ${#snaps[@]} - 1 )); then note+="  <- latest"; fi
-    printf '%-19s  %10s%s\n' "${snaps[i]}" "$(human_size $((added[i] * 1024)))" "$note"
+    printf '%-17s  %10s%s\n' "${snaps[i]}" "$(human_size $((added[i] * 1024)))" "$note"
     total_kb=$((total_kb + added[i]))
   done
   printf '\nСнимков: %d, занято на диске: %s, без жёстких ссылок было бы: %s\n' \
