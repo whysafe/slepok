@@ -1,0 +1,12 @@
+[Unit]
+Description=slepok: ежедневный снимок (%i)
+Documentation=https://github.com/whysafe/slepok
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=20min
+# если компьютер был выключен в 03:00, снимок сделается после включения
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=slepok: снимок резервной копии (%i)
+Documentation=https://github.com/whysafe/slepok
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Токены для on_error (например, TG_TOKEN и TG_CHAT) кладите сюда, а не в конфиг
+EnvironmentFile=-/etc/slepok/%i.env
+ExecStart=/usr/local/bin/slepok -c /etc/slepok/%i.conf backup
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=true

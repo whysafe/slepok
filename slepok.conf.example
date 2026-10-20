@@ -1,0 +1,47 @@
+# Конфиг slepok. Формат: ключ = значение, # в начале строки = комментарий.
+# Положите копию в /etc/slepok/main.conf и включите таймер:
+#   sudo systemctl enable --now slepok@main.timer
+
+# Куда складывать снимки: внешний диск, второй раздел, смонтированный NAS.
+# Файловая система должна поддерживать жёсткие ссылки (ext4, btrfs, xfs; не exFAT).
+dest = /mnt/backup/slepok
+
+# Что копировать. Строк source может быть сколько угодно.
+# Внутри снимка сохраняется полный путь: /home/alex попадёт в СНИМОК/home/alex.
+# Каталог с другой машины: user@host:/var/www (нужен вход по ssh-ключу).
+source = /home/alex
+source = /etc
+source = /var/backups/db
+
+# Исключения в синтаксисе rsync. Путь с / в начале считается от корня.
+exclude = .cache/
+exclude = node_modules/
+exclude = __pycache__/
+exclude = *.tmp
+exclude = /home/alex/Downloads/
+
+# Сколько снимков хранить. Каждое правило оставляет самый свежий снимок
+# в своём интервале; снимок, нужный хотя бы одному правилу, не удаляется.
+keep_last = 3
+keep_daily = 7
+keep_weekly = 4
+keep_monthly = 12
+keep_yearly = 2
+
+# Не начинать копирование, если на диске меньше столько МиБ.
+min_free_mb = 2048
+
+# slepok check вернёт ошибку, если последний снимок старше этого (для мониторинга).
+max_age_hours = 30
+
+# Дополнительные параметры rsync, например ACL и расширенные атрибуты.
+# rsync_options = --acls --xattrs
+
+# Команды до и после снимка. Доступны $SLEPOK_SNAPSHOT и $SLEPOK_DEST.
+# Ошибка в pre_hook отменяет снимок.
+pre_hook = pg_dump -U postgres shop > /var/backups/db/shop.sql
+post_hook =
+
+# Выполняется, если backup упал. Код ошибки в $SLEPOK_EXIT_CODE.
+# Пример уведомления в Telegram (TG_TOKEN и TG_CHAT задайте в /etc/slepok/main.env):
+# on_error = curl -fsS "https://api.telegram.org/bot$TG_TOKEN/sendMessage" -d chat_id="$TG_CHAT" -d text="slepok на $(hostname): ошибка, код $SLEPOK_EXIT_CODE"

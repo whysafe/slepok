@@ -1,0 +1,19 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rsync and shellcheck
+        run: sudo apt-get update -q && sudo apt-get install -yq rsync shellcheck
+      - name: ShellCheck
+        run: shellcheck slepok install.sh tests/run.sh completions/slepok.bash
+      - name: Tests
+        run: bash tests/run.sh
+        env:
+          SLEPOK_REQUIRE_ALL: "1"

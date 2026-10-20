@@ -1,0 +1,594 @@
+#!/usr/bin/env bash
+#
+# slepok: инкрементальные снимки каталогов через rsync --link-dest
+# с ротацией «последние / дни / недели / месяцы / годы».
+# https://github.com/whysafe/slepok
+
+SLEPOK_VERSION="1.0.0"
+SNAPSHOT_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}$'
+
+CONFIG_FILE="${SLEPOK_CONFIG:-/etc/slepok/main.conf}"
+COMMAND=""
+DRY_RUN=0
+QUIET=0
+LOCKED=0
+CURRENT_TMP=""
+
+SOURCES=()
+EXCLUDES=()
+DEST=""
+KEEP_LAST=0
+KEEP_DAILY=7
+KEEP_WEEKLY=4
+KEEP_MONTHLY=12
+KEEP_YEARLY=0
+MIN_FREE_MB=0
+MAX_AGE_HOURS=0
+RSYNC_OPTIONS=""
+PRE_HOOK=""
+POST_HOOK=""
+ON_ERROR=""
+
+usage() {
+  cat <<'EOF'
+slepok: снимки резервных копий на rsync с жёсткими ссылками
+
+Использование:
+  slepok [-c КОНФИГ] [-n] [-q] КОМАНДА [АРГУМЕНТЫ]
+
+Команды:
+  backup [--no-prune]          сделать новый снимок и почистить старые
+  list [--names]               список снимков и сколько места добавил каждый
+  prune                        удалить снимки, не попадающие под правила хранения
+  diff [СНИМОК_А] [СНИМОК_Б]   что изменилось между снимками (по умолчанию два последних)
+  history ПУТЬ                 все версии файла по снимкам
+  restore СНИМОК ПУТЬ [КУДА]   достать файл или папку из снимка
+  check                        проверить конфиг, источники, место и свежесть копии
+
+Параметры:
+  -c, --config ФАЙЛ   конфиг (по умолчанию /etc/slepok/main.conf или $SLEPOK_CONFIG)
+  -n, --dry-run       показать, что будет сделано, ничего не меняя
+  -q, --quiet         печатать только ошибки
+  -h, --help          эта справка
+  -V, --version       версия
+
+Снимок можно указать полным именем, уникальным началом имени (2026-10-20),
+словом latest или previous.
+EOF
+}
+
+log()  { if (( ! QUIET )); then printf '%s\n' "$*"; fi; }
+warn() { printf 'slepok: %s\n' "$*" >&2; }
+die()  { warn "$*"; exit 1; }
+
+require() {
+  local tool
+  for tool in "$@"; do
+    command -v "$tool" > /dev/null || die "не найдена программа $tool, установите её"
+  done
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+human_size() {
+  awk -v bytes="$1" 'BEGIN {
+    split("B KiB MiB GiB TiB", unit, " ")
+    v = bytes; i = 1
+    while (v >= 1024 && i < 5) { v /= 1024; i++ }
+    if (i == 1) printf "%d %s", v, unit[i]
+    else printf "%.1f %s", v, unit[i]
+  }'
+}
+
+abs_path() { realpath -m -- "$1"; }
+
+snapshot_epoch() {
+  local n="$1"
+  date -d "${n:0:10} ${n:11:2}:${n:13:2}:${n:15:2}" +%s
+}
+
+now_epoch() { date -d "${SLEPOK_NOW:-now}" +%s; }
+
+is_remote() { [[ "$1" =~ ^[^/]*: ]]; }
+
+# --- конфиг -------------------------------------------------------------
+
+load_config() {
+  local file="$1" line key value n=0
+  [[ -r "$file" ]] || die "не могу прочитать конфиг $file (укажите другой через -c)"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    line="$(trim "$line")"
+    if [[ -z "$line" || "$line" == \#* ]]; then continue; fi
+    [[ "$line" == *=* ]] || die "$file:$n: ожидается строка вида «ключ = значение»"
+    key="$(trim "${line%%=*}")"
+    value="$(trim "${line#*=}")"
+
+    case "$key" in
+      source)  SOURCES+=("$value") ;;
+      exclude) EXCLUDES+=("$value") ;;
+      dest)    DEST="${value%/}" ;;
+      keep_last | keep_daily | keep_weekly | keep_monthly | keep_yearly | min_free_mb | max_age_hours)
+        [[ "$value" =~ ^[0-9]+$ ]] || die "$file:$n: $key должен быть целым числом, а не «$value»"
+        printf -v "${key^^}" '%s' "$((10#$value))"
+        ;;
+      rsync_options | pre_hook | post_hook | on_error)
+        printf -v "${key^^}" '%s' "$value"
+        ;;
+      *) die "$file:$n: неизвестный ключ «$key»" ;;
+    esac
+  done < "$file"
+
+  [[ -n "$DEST" ]] || die "$file: не задан dest, куда складывать снимки"
+  [[ "$DEST" == /* ]] || die "$file: dest должен быть абсолютным путём"
+  (( ${#SOURCES[@]} > 0 )) || die "$file: нет ни одной строки source"
+}
+
+# --- снимки -------------------------------------------------------------
+
+list_snapshots() {
+  local dir name
+  [[ -d "$DEST" ]] || return 0
+  for dir in "$DEST"/*/; do
+    name="${dir%/}"
+    name="${name##*/}"
+    if [[ "$name" =~ $SNAPSHOT_RE ]]; then printf '%s\n' "$name"; fi
+  done | LC_ALL=C sort
+}
+
+resolve_snapshot() {
+  local want="$1" s
+  local -a snaps matches=()
+  mapfile -t snaps < <(list_snapshots)
+  (( ${#snaps[@]} > 0 )) || die "в $DEST пока нет снимков"
+
+  case "$want" in
+    latest)
+      printf '%s\n' "${snaps[-1]}"
+      return 0
+      ;;
+    previous)
+      (( ${#snaps[@]} > 1 )) || die "снимок пока только один, сравнивать не с чем"
+      printf '%s\n' "${snaps[-2]}"
+      return 0
+      ;;
+  esac
+
+  for s in "${snaps[@]}"; do
+    if [[ "$s" == "$want"* ]]; then matches+=("$s"); fi
+  done
+  case ${#matches[@]} in
+    1) printf '%s\n' "${matches[0]}" ;;
+    0) die "снимок «$want» не найден, список: slepok list" ;;
+    *) die "«$want» подходит к нескольким снимкам: ${matches[*]}" ;;
+  esac
+}
+
+acquire_lock() {
+  if (( LOCKED )); then return 0; fi
+  require flock
+  exec 9> "$DEST/.lock"
+  flock -n 9 || die "с $DEST уже работает другой запуск slepok"
+  LOCKED=1
+}
+
+check_free_space() {
+  (( MIN_FREE_MB > 0 )) || return 0
+  local free_kb
+  free_kb="$(df -Pk -- "$DEST" | awk 'NR == 2 { print $4 }')"
+  (( free_kb / 1024 >= MIN_FREE_MB )) ||
+    die "на $DEST свободно $((free_kb / 1024)) МиБ, а нужно не меньше $MIN_FREE_MB"
+}
+
+run_hook() {
+  local name="$1" command="$2"
+  [[ -n "$command" ]] || return 0
+  if (( DRY_RUN )); then
+    log "Пропускаю $name в пробном режиме"
+    return 0
+  fi
+  log "Запускаю $name"
+  bash -c "$command" || die "$name завершился с кодом $?"
+}
+
+# Решает, какие снимки оставить. Принимает имена от старых к новым и печатает
+# по строке на снимок: «keep|drop<TAB>имя<TAB>причины». Идём от новых к старым;
+# каждое правило берёт самый свежий снимок в своём интервале (день, ISO-неделя,
+# месяц, год), пока не наберёт нужное количество.
+plan_retention() {
+  local -a names=("$@") lines=()
+  local -a policies=(last daily weekly monthly yearly)
+  local -A limit=([last]=$KEEP_LAST [daily]=$KEEP_DAILY [weekly]=$KEEP_WEEKLY
+                  [monthly]=$KEEP_MONTHLY [yearly]=$KEEP_YEARLY)
+  local -A label=([last]=последний [daily]=день [weekly]=неделя [monthly]=месяц [yearly]=год)
+  local -A count=() seen=() key=()
+  local i p name reasons
+
+  if (( KEEP_LAST + KEEP_DAILY + KEEP_WEEKLY + KEEP_MONTHLY + KEEP_YEARLY == 0 )); then
+    die "все keep_* равны нулю: такие правила удалили бы все снимки"
+  fi
+
+  for p in "${policies[@]}"; do
+    count[$p]=0
+    seen[$p]=""
+  done
+
+  for (( i = ${#names[@]} - 1; i >= 0; i-- )); do
+    name="${names[i]}"
+    key=([last]="$name" [daily]="${name:0:10}" [weekly]="$(date -d "${name:0:10}" +%G-W%V)"
+         [monthly]="${name:0:7}" [yearly]="${name:0:4}")
+    reasons=""
+    for p in "${policies[@]}"; do
+      if (( count[$p] < limit[$p] )) && [[ "${key[$p]}" != "${seen[$p]}" ]]; then
+        count[$p]=$((count[$p] + 1))
+        seen[$p]="${key[$p]}"
+        reasons+="${reasons:+, }${label[$p]}"
+      fi
+    done
+    if [[ -n "$reasons" ]]; then
+      lines[i]="keep"$'\t'"$name"$'\t'"$reasons"
+    else
+      lines[i]="drop"$'\t'"$name"$'\t'"-"
+    fi
+  done
+
+  if (( ${#lines[@]} > 0 )); then printf '%s\n' "${lines[@]}"; fi
+}
+
+remove_snapshot() {
+  local path="${DEST:?}/$1"
+  # снимок может содержать каталоги без права записи, их надо открыть перед удалением
+  rm -rf -- "$path" 2> /dev/null || { chmod -R u+w -- "$path" && rm -rf -- "$path"; }
+}
+
+print_rsync_stats() {
+  local log_file="$1" total copied bytes
+  total="$(sed -n 's/^Number of files: \([0-9,]*\).*/\1/p' "$log_file" | tr -d ,)"
+  copied="$(sed -n 's/^Number of regular files transferred: \([0-9,]*\).*/\1/p' "$log_file" | tr -d ,)"
+  bytes="$(sed -n 's/^Total transferred file size: \([0-9,]*\).*/\1/p' "$log_file" | tr -d ,)"
+  if [[ -n "$total" && -n "$copied" ]]; then
+    log "  объектов в снимке: $total, скопировано заново: $copied ($(human_size "${bytes:-0}")), остальное взято жёсткими ссылками"
+  fi
+}
+
+# shellcheck disable=SC2317  # вызывается из trap
+on_exit() {
+  local rc=$?
+  if [[ -n "$CURRENT_TMP" ]]; then rm -rf -- "$CURRENT_TMP"; fi
+  if (( rc != 0 )) && [[ "$COMMAND" == backup && -n "$ON_ERROR" ]] && (( ! DRY_RUN )); then
+    SLEPOK_EXIT_CODE=$rc bash -c "$ON_ERROR" || warn "on_error тоже завершился с ошибкой"
+  fi
+}
+
+# --- команды ------------------------------------------------------------
+
+cmd_backup() {
+  local prune_after=1
+  while (( $# > 0 )); do
+    case "$1" in
+      --no-prune) prune_after=0 ;;
+      *) die "backup: неизвестный параметр $1" ;;
+    esac
+    shift
+  done
+
+  require rsync
+  mkdir -p -- "$DEST"
+  acquire_lock
+  check_free_space
+
+  local name prev tmp pattern rc=0
+  local -a args extra
+  name="$(date -d "${SLEPOK_NOW:-now}" +%Y-%m-%d_%H%M%S)"
+  [[ ! -e "$DEST/$name" ]] || die "снимок $name уже существует"
+  prev="$(list_snapshots | tail -n 1)"
+
+  # остатки от прерванных запусков: питание выключили, диск отвалился
+  rm -rf -- "$DEST"/.inprogress-*
+  tmp="$DEST/.inprogress-$name"
+
+  export SLEPOK_SNAPSHOT="$name" SLEPOK_DEST="$DEST"
+  run_hook pre_hook "$PRE_HOOK"
+
+  args=(--archive --hard-links --relative --numeric-ids --stats --no-human-readable)
+  read -r -a extra <<< "$RSYNC_OPTIONS"
+  args+=("${extra[@]}")
+  for pattern in "${EXCLUDES[@]}"; do args+=("--exclude=$pattern"); done
+  if [[ -n "$prev" ]]; then args+=("--link-dest=$DEST/$prev"); fi
+  if (( DRY_RUN )); then args+=(--dry-run); fi
+
+  log "Снимок $name${prev:+, основа: $prev}"
+  CURRENT_TMP="$tmp"
+  mkdir -p -- "$tmp"
+  rsync "${args[@]}" "${SOURCES[@]}" "$tmp/" > "$DEST/.last-rsync.log" 2>&1 || rc=$?
+
+  case $rc in
+    0) ;;
+    24) warn "часть файлов исчезла во время копирования, снимок всё равно сохранён" ;;
+    *) die "rsync завершился с кодом $rc, подробности в $DEST/.last-rsync.log" ;;
+  esac
+  print_rsync_stats "$DEST/.last-rsync.log"
+
+  if (( DRY_RUN )); then
+    rm -rf -- "$tmp"
+    CURRENT_TMP=""
+    log "Пробный запуск: снимок не сохранён"
+    return 0
+  fi
+
+  mv -- "$tmp" "$DEST/$name"
+  CURRENT_TMP=""
+  ln -sfn -- "$name" "$DEST/latest"
+  log "Готово: $DEST/$name"
+
+  run_hook post_hook "$POST_HOOK"
+  if (( prune_after )); then cmd_prune; fi
+}
+
+cmd_prune() {
+  local -a snaps
+  local plan action name reasons dropped=0 before after
+  mapfile -t snaps < <(list_snapshots)
+  if (( ${#snaps[@]} == 0 )); then
+    log "Снимков нет, удалять нечего"
+    return 0
+  fi
+  if (( ! DRY_RUN )); then acquire_lock; fi
+
+  plan="$(plan_retention "${snaps[@]}")"
+  before="$(du -sk -- "$DEST" | cut -f1)"
+  log "Ротация снимков:"
+  while IFS=$'\t' read -r action name reasons; do
+    if [[ "$action" == keep ]]; then
+      log "  оставить  $name  ($reasons)"
+      continue
+    fi
+    dropped=$((dropped + 1))
+    if (( DRY_RUN )); then
+      log "  удалить   $name  (пробный запуск)"
+    else
+      log "  удалить   $name"
+      remove_snapshot "$name"
+    fi
+  done <<< "$plan"
+
+  if (( dropped == 0 )); then
+    log "Лишних снимков нет"
+  elif (( ! DRY_RUN )); then
+    after="$(du -sk -- "$DEST" | cut -f1)"
+    log "Удалено снимков: $dropped, освобождено $(human_size $(((before - after) * 1024)))"
+  fi
+}
+
+cmd_list() {
+  local names_only=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --names) names_only=1 ;;
+      *) die "list: неизвестный параметр $1" ;;
+    esac
+    shift
+  done
+
+  local -a snaps paths=() added
+  mapfile -t snaps < <(list_snapshots)
+  if (( names_only )); then
+    if (( ${#snaps[@]} > 0 )); then printf '%s\n' "${snaps[@]}"; fi
+    return 0
+  fi
+  if (( ${#snaps[@]} == 0 )); then
+    log "В $DEST пока нет снимков. Первый: slepok backup"
+    return 0
+  fi
+
+  local s i total_kb=0 full_kb note
+  for s in "${snaps[@]}"; do paths+=("$DEST/$s"); done
+  # du считает каждый inode один раз и идёт по аргументам по порядку,
+  # поэтому для каждого снимка выходит ровно то, что он добавил к предыдущим
+  mapfile -t added < <(du -sk -- "${paths[@]}" | cut -f1)
+  full_kb="$(du -sklc -- "${paths[@]}" | tail -n 1 | cut -f1)"
+
+  printf '%-19s  %10s\n' "SNAPSHOT" "ADDED"
+  for i in "${!snaps[@]}"; do
+    note=""
+    if (( i == 0 )); then note="  полная копия"; fi
+    if (( i == ${#snaps[@]} - 1 )); then note+="  <- latest"; fi
+    printf '%-19s  %10s%s\n' "${snaps[i]}" "$(human_size $((added[i] * 1024)))" "$note"
+    total_kb=$((total_kb + added[i]))
+  done
+  printf '\nСнимков: %d, занято на диске: %s, без жёстких ссылок было бы: %s\n' \
+    "${#snaps[@]}" "$(human_size $((total_kb * 1024)))" "$(human_size $((full_kb * 1024)))"
+}
+
+cmd_diff() {
+  (( $# <= 2 )) || die "использование: slepok diff [СНИМОК_А] [СНИМОК_Б]"
+  require rsync
+  local from to flags path line added=0 changed=0 removed=0
+  from="$(resolve_snapshot "${1:-previous}")"
+  to="$(resolve_snapshot "${2:-latest}")"
+  [[ "$from" != "$to" ]] || die "это один и тот же снимок"
+
+  log "Изменения $from -> $to"
+  while IFS= read -r line; do
+    flags="${line%%$'\t'*}"
+    path="/${line#*$'\t'}"
+    case "$flags" in
+      '*deleting')
+        if [[ "$path" != */ ]]; then
+          printf -- '- %s\n' "$path"
+          removed=$((removed + 1))
+        fi
+        ;;
+      '>f+++++++++' | 'cL+++++++++')
+        printf '+ %s\n' "$path"
+        added=$((added + 1))
+        ;;
+      '>f'* | 'cL'*)
+        printf '~ %s\n' "$path"
+        changed=$((changed + 1))
+        ;;
+    esac
+  done < <(rsync --archive --dry-run --delete --no-human-readable \
+             --out-format=$'%i\t%n' "$DEST/$to/" "$DEST/$from/")
+
+  log "Добавлено: $added, изменено: $changed, удалено: $removed"
+}
+
+cmd_history() {
+  (( $# == 1 )) || die "использование: slepok history ПУТЬ"
+  local abs rel s file inode size mtime prev_inode="" versions=0
+  local -a snaps
+  abs="$(abs_path "$1")"
+  rel="${abs#/}"
+  mapfile -t snaps < <(list_snapshots)
+
+  for s in "${snaps[@]}"; do
+    file="$DEST/$s/$rel"
+    if [[ -f "$file" ]]; then
+      read -r inode size mtime < <(stat -c '%i %s %Y' -- "$file")
+      # в неизменившемся файле жёсткая ссылка на тот же inode, новый inode = новая версия
+      if [[ "$inode" != "$prev_inode" ]]; then
+        versions=$((versions + 1))
+        printf '%s  %10s  изменён %s\n' "$s" "$(human_size "$size")" "$(date -d "@$mtime" '+%Y-%m-%d %H:%M')"
+      fi
+      prev_inode="$inode"
+    elif [[ -n "$prev_inode" ]]; then
+      printf '%s  удалён\n' "$s"
+      prev_inode=""
+    fi
+  done
+
+  (( versions > 0 )) || die "$abs нет ни в одном снимке"
+  log "Версий: $versions. Достать нужную: slepok restore СНИМОК $abs КУДА"
+}
+
+cmd_restore() {
+  (( $# >= 2 && $# <= 3 )) || die "использование: slepok restore СНИМОК ПУТЬ [КУДА]"
+  require rsync
+  local snap abs src target
+  local -a args=(--archive --hard-links --no-human-readable)
+  snap="$(resolve_snapshot "$1")"
+  abs="$(abs_path "$2")"
+  src="$DEST/$snap/${abs#/}"
+  [[ -e "$src" || -L "$src" ]] || die "в снимке $snap нет $abs"
+  target="${3:-./slepok-restore-$snap}"
+
+  if (( DRY_RUN )); then args+=(--dry-run --itemize-changes); fi
+  mkdir -p -- "$target"
+  rsync "${args[@]}" "$src" "$target/"
+  if (( DRY_RUN )); then
+    log "Пробный запуск: файлы не скопированы"
+  else
+    log "Восстановлено $abs из $snap в $target/${abs##*/}"
+  fi
+}
+
+cmd_check() {
+  local problems=0 src free_kb latest age_h
+  local -a snaps
+  ok()  { printf '  [ok] %s\n' "$*"; }
+  bad() { printf '  [!!] %s\n' "$*"; problems=$((problems + 1)); }
+
+  printf 'Конфиг %s\n' "$CONFIG_FILE"
+  if command -v rsync > /dev/null; then ok "rsync: $(rsync --version | head -n 1)"; else bad "rsync не установлен"; fi
+  if command -v flock > /dev/null; then ok "flock найден"; else bad "flock не найден (пакет util-linux)"; fi
+
+  for src in "${SOURCES[@]}"; do
+    if is_remote "$src"; then
+      ok "источник $src удалённый, проверит rsync при копировании"
+    elif [[ -e "$src" ]]; then
+      ok "источник $src"
+    else
+      bad "источник $src не существует"
+    fi
+  done
+
+  if [[ -d "$DEST" && -w "$DEST" ]]; then
+    free_kb="$(df -Pk -- "$DEST" | awk 'NR == 2 { print $4 }')"
+    if (( MIN_FREE_MB > 0 && free_kb / 1024 < MIN_FREE_MB )); then
+      bad "на $DEST свободно $(human_size $((free_kb * 1024))), меньше min_free_mb = $MIN_FREE_MB"
+    else
+      ok "$DEST доступен для записи, свободно $(human_size $((free_kb * 1024)))"
+    fi
+  elif [[ -e "$DEST" ]]; then
+    bad "$DEST недоступен для записи"
+  else
+    ok "$DEST ещё не создан, появится при первом backup"
+  fi
+
+  mapfile -t snaps < <(list_snapshots)
+  if (( ${#snaps[@]} == 0 )); then
+    if (( MAX_AGE_HOURS > 0 )); then bad "снимков нет"; else ok "снимков пока нет"; fi
+  else
+    latest="${snaps[-1]}"
+    age_h=$(( ($(now_epoch) - $(snapshot_epoch "$latest")) / 3600 ))
+    if (( MAX_AGE_HOURS > 0 && age_h > MAX_AGE_HOURS )); then
+      bad "последний снимок $latest сделан $age_h ч назад, больше max_age_hours = $MAX_AGE_HOURS"
+    else
+      ok "снимков: ${#snaps[@]}, последний $latest ($age_h ч назад)"
+    fi
+  fi
+
+  if (( problems > 0 )); then
+    printf 'Найдено проблем: %d\n' "$problems"
+    return 1
+  fi
+  printf 'Всё в порядке\n'
+}
+
+main() {
+  local -a rest=()
+  while (( $# > 0 )); do
+    case "$1" in
+      -c | --config)
+        (( $# >= 2 )) || die "после $1 нужен путь к конфигу"
+        CONFIG_FILE="$2"
+        shift 2
+        continue
+        ;;
+      -n | --dry-run) DRY_RUN=1 ;;
+      -q | --quiet) QUIET=1 ;;
+      -h | --help) usage; return 0 ;;
+      -V | --version) printf 'slepok %s\n' "$SLEPOK_VERSION"; return 0 ;;
+      --) shift; rest+=("$@"); break ;;
+      *) rest+=("$1") ;;
+    esac
+    shift
+  done
+  set -- "${rest[@]}"
+
+  if (( $# == 0 )); then
+    usage >&2
+    return 2
+  fi
+  COMMAND="$1"
+  shift
+  if [[ "$COMMAND" == help ]]; then
+    usage
+    return 0
+  fi
+
+  load_config "$CONFIG_FILE"
+  trap on_exit EXIT
+  case "$COMMAND" in
+    backup)  cmd_backup "$@" ;;
+    list)    cmd_list "$@" ;;
+    prune)   (( $# == 0 )) || die "prune не принимает аргументов"; cmd_prune ;;
+    diff)    cmd_diff "$@" ;;
+    history) cmd_history "$@" ;;
+    restore) cmd_restore "$@" ;;
+    check)   cmd_check "$@" ;;
+    *) die "неизвестная команда «$COMMAND», см. slepok --help" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  set -o errexit -o nounset -o pipefail
+  main "$@"
+fi
